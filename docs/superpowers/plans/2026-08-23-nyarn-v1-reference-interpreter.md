@@ -151,6 +151,7 @@ runner / repl / cmd
 - Produces:
   - `source.Position{Offset int, Line int, Column int}`
   - `source.Span{Start Position, End Position}`
+  - `source.Join(a, b Span) Span`
   - `token.Token{Kind Kind, Lexeme string, Literal any, Span source.Span}`
   - `lexer.Lex(filename, input string) ([]token.Token, []diagnostic.Diagnostic)` once diagnostics exist; until Task 2, use `([]token.Token, error)` and convert in Task 2.
 - Recognizes every v1 keyword and reserved future word from `docs/SPEC.md`.
@@ -167,9 +168,21 @@ module github.com/mafuzyk/Nyarn
 go 1.24
 ```
 
-`internal/lexer/lexer_test.go` must include table-driven tests for keywords, identifiers, numeric literals, strings, operators, punctuation, comments, Unicode identifiers, and newlines:
+`internal/lexer/lexer_test.go` must include table-driven tests for keywords, identifiers, numeric literals, strings, operators, punctuation, comments, Unicode identifiers, newlines, and the `0..10` range-vs-float boundary. Define the shared helper in that file:
 
 ```go
+func assertKinds(t *testing.T, got []token.Token, want []token.Kind) {
+    t.Helper()
+    if len(got) != len(want) {
+        t.Fatalf("token count = %d, want %d", len(got), len(want))
+    }
+    for i := range want {
+        if got[i].Kind != want[i] {
+            t.Fatalf("token %d kind = %v, want %v", i, got[i].Kind, want[i])
+        }
+    }
+}
+
 func TestLexCanonicalDeclaration(t *testing.T) {
     got, err := Lex("test.nyarn", `mew nyame: meow = "Mafu"` + "\n")
     if err != nil {
@@ -201,6 +214,17 @@ func TestCommentsStopAtNewline(t *testing.T) {
     assertKinds(t, got, []token.Kind{
         token.MEW, token.IDENTIFIER, token.EQUAL, token.PAW,
         token.NEWLINE, token.PURR, token.IDENTIFIER, token.NEWLINE, token.EOF,
+    })
+}
+
+func TestLexRangeDoesNotBecomeFloat(t *testing.T) {
+    got, err := Lex("test.nyarn", "hunt i in 0..10 {}\n")
+    if err != nil {
+        t.Fatal(err)
+    }
+    assertKinds(t, got, []token.Kind{
+        token.HUNT, token.IDENTIFIER, token.IN, token.PAW, token.DOT_DOT,
+        token.PAW, token.LEFT_BRACE, token.RIGHT_BRACE, token.NEWLINE, token.EOF,
     })
 }
 ```
@@ -377,6 +401,7 @@ git commit -m "feat: add structured Nyarn diagnostics"
 
 **Interfaces:**
 - Produces:
+  - `ast.Program{Statements []Stmt, NodeSpan source.Span}`
   - `ast.Expr` and concrete expression structs
   - `ast.Stmt` and concrete statement structs
   - `ast.TypeExpr` for `paw`, `whisker`, `meow`, `mood`, `clowder T`, `maybe T`
@@ -391,7 +416,16 @@ Minimum statement nodes:
 
 - [ ] **Step 1: Write failing AST span tests**
 
+Define the test helper explicitly:
+
 ```go
+func span(sl, sc, el, ec int) source.Span {
+    return source.Span{
+        Start: source.Position{Line: sl, Column: sc},
+        End:   source.Position{Line: el, Column: ec},
+    }
+}
+
 func TestBinaryExprSpanCoversOperands(t *testing.T) {
     left := &PawLiteral{Value: 1, NodeSpan: span(1, 1, 1, 2)}
     right := &PawLiteral{Value: 2, NodeSpan: span(1, 5, 1, 6)}
@@ -479,9 +513,18 @@ git commit -m "feat: define Nyarn AST"
 
 - [ ] **Step 1: Write failing precedence tests**
 
-Required assertions:
+Required assertions. Define `parseExpr` in the same test file:
 
 ```go
+func parseExpr(t *testing.T, input string) ast.Expr {
+    t.Helper()
+    expr, diags := ParseExpressionForTest("test.nyarn", input)
+    if len(diags) != 0 {
+        t.Fatalf("diagnostics = %#v", diags)
+    }
+    return expr
+}
+
 func TestPowerIsRightAssociative(t *testing.T) {
     expr := parseExpr(t, "2 ** 3 ** 2")
     outer := expr.(*ast.BinaryExpr)
@@ -762,6 +805,29 @@ Required programs:
 5. Assigning through `mew` list index fails.
 6. Assigning through `scratch` list index passes.
 
+Define shared checker test helpers in `checker_test.go`:
+
+```go
+func checkSource(t *testing.T, src string) []diagnostic.Diagnostic {
+    t.Helper()
+    program, parseDiags := parser.Parse("test.nyarn", src)
+    if len(parseDiags) != 0 {
+        t.Fatalf("parse diagnostics = %#v", parseDiags)
+    }
+    return New().Check(program)
+}
+
+func assertHasDiagnostic(t *testing.T, diags []diagnostic.Diagnostic, kind diagnostic.Kind, contains string) {
+    t.Helper()
+    for _, d := range diags {
+        if d.Kind == kind && strings.Contains(d.Message, contains) {
+            return
+        }
+    }
+    t.Fatalf("missing %v diagnostic containing %q: %#v", kind, contains, diags)
+}
+```
+
 Example:
 
 ```go
@@ -788,6 +854,7 @@ Implementation rules:
 - Build a global scope.
 - Predeclare all top-level `pounce` names before checking executable top-level statements.
 - Do not predeclare `mew`/`scratch`.
+- For Task 7 only, declarations with an explicit annotation record that type immediately; unannotated declarations may use `Dynamic` as a temporary checker type until Task 8 adds full initializer inference.
 - Each block creates a child scope.
 - Function parameters bind in the function-local scope.
 - A function scope has an explicit link to globals, not an enclosing function-local closure chain.
@@ -1288,6 +1355,7 @@ Required:
 - checker/type error => exit 3 and no execution;
 - explicit `hiss`/division zero => exit 1;
 - missing file => exit 4;
+- a file path without the `.nyarn` extension => exit 4;
 - successful hello => exit 0;
 - injected panic from a test-only interpreter hook => internal diagnostic, no raw Go stack unless debug mode is enabled.
 
@@ -1302,6 +1370,8 @@ Expected: compilation failure.
 - [ ] **Step 3: Implement runner pipeline and diagnostic rendering**
 
 Render all diagnostics to `stderr`. User program `purr` output goes to `stdout`.
+
+`RunFile` must reject a non-`.nyarn` path with an I/O/CLI diagnostic and exit code 4 before reading or executing it.
 
 Map errors:
 - lexer/parser syntax => 2
@@ -1327,7 +1397,100 @@ git commit -m "feat: add Nyarn execution pipeline"
 
 ---
 
-### Task 15: Implement the CLI entry point and exact command behavior
+### Task 15: Implement the persistent multiline REPL
+
+**Files:**
+- Create: `internal/repl/repl.go`
+- Create: `internal/repl/repl_test.go`
+- Modify: `internal/checker/checker.go`
+- Modify: `internal/checker/scope.go`
+- Modify: `internal/runtime/environment.go`
+
+**Interfaces:**
+- Produces:
+  - `repl.Run(stdin io.Reader, stdout, stderr io.Writer) int`
+  - `(*checker.Checker).Clone() *checker.Checker`
+  - `(*runtime.Environment).Clone() *runtime.Environment`
+- Global semantic scope, runtime environment, and top-level functions persist across successful entries.
+- User errors do not terminate the REPL.
+- Incomplete `{`, `[`, `(` input continues with `... ` prompt.
+- A submitted unit is lexed, parsed, checked, and executed before accepting the next unit.
+
+- [ ] **Step 1: Write failing REPL transcript tests**
+
+Input:
+
+```text
+mew x = 9
+purr x
+scratch y = 2
+y = 7
+purr y
+```
+
+must include `9` and `7`.
+
+Multiline input:
+
+```text
+pounce greet(nyame: meow) {
+purr "Henlo, {nyame}"
+}
+greet("Mafu")
+```
+
+must define the function and print `Henlo, Mafu`.
+
+Error recovery transcript:
+- submit `purr 1 / 0`;
+- then submit `purr "still here"`;
+- output must contain the HISS diagnostic and `still here`.
+
+Transactional-state transcript:
+- submit a multiline unit that declares `mew doomed = 1` and then HISSes;
+- next submit `purr doomed`;
+- the second submission must produce an unknown-name HISS because failed units do not commit semantic/runtime state.
+
+- [ ] **Step 2: Run REPL tests and confirm failure**
+
+```bash
+go test ./internal/repl -v
+```
+
+Expected: compilation failure.
+
+- [ ] **Step 3: Implement cloneable checker/runtime state and persistent REPL sessions**
+
+Create a session object that owns:
+- persistent checker state/global semantic scope;
+- persistent runtime global environment and function declarations;
+- accumulated source-name counter such as `<repl:1>`, `<repl:2>`;
+- input balance state.
+
+`Checker.Clone` must deep-copy scopes/binding metadata used by the persistent global checker state. `Environment.Clone` must copy the binding map and clowder values using Nyarn value semantics so a trial submission cannot mutate committed state through a shared Go slice.
+
+Treat each submitted REPL unit transactionally: clone the checker global state and runtime global environment, check and execute against the clones, and commit both clones only when the unit succeeds. A syntax/checker/runtime HISS must leave the previously committed REPL state unchanged. This keeps semantic and runtime state synchronized even when an error occurs before or after a declaration.
+
+Do not concatenate all previous REPL source and re-execute it. Execute only the new submission against the persistent committed session state.
+
+- [ ] **Step 4: Run REPL plus checker/runtime regression tests**
+
+```bash
+go test ./internal/repl ./internal/checker ./internal/runtime -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit REPL**
+
+```bash
+git add internal/repl internal/checker internal/runtime
+git commit -m "feat: add transactional Nyarn REPL"
+```
+
+---
+
+### Task 16: Implement the CLI entry point and exact command behavior
 
 **Files:**
 - Create: `cmd/nyarn/main.go`
@@ -1336,7 +1499,7 @@ git commit -m "feat: add Nyarn execution pipeline"
 **Interfaces:**
 - `nyarn file.nyarn` executes a file.
 - `nyarn run file.nyarn` executes the same file.
-- `nyarn` starts the REPL after Task 16.
+- `nyarn` starts the REPL.
 - invalid argument shapes return exit 4 and a concise usage diagnostic.
 
 - [ ] **Step 1: Write failing CLI argument tests**
@@ -1348,7 +1511,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 ```
 
 Required cases:
-- `[]` delegates to REPL entry point;
+- `[]` calls `repl.Run`;
 - `["hello.nyarn"]` delegates to file runner;
 - `["run", "hello.nyarn"]` delegates to file runner;
 - `["run"]` => 4;
@@ -1388,88 +1551,6 @@ Expected: PASS and successful build.
 ```bash
 git add cmd/nyarn
 git commit -m "feat: add Nyarn CLI"
-```
-
----
-
-### Task 16: Implement the persistent multiline REPL
-
-**Files:**
-- Create: `internal/repl/repl.go`
-- Create: `internal/repl/repl_test.go`
-- Modify: `cmd/nyarn/main.go`
-
-**Interfaces:**
-- Produces:
-  - `repl.Run(stdin io.Reader, stdout, stderr io.Writer) int`
-- Global environment and top-level function table persist across successful entries.
-- User errors do not terminate the REPL.
-- Incomplete `{`, `[`, `(` input continues with `... ` prompt.
-- A submitted unit is lexed, parsed, checked, and executed before accepting the next unit.
-
-- [ ] **Step 1: Write failing REPL transcript tests**
-
-Input:
-
-```text
-mew x = 9
-purr x
-scratch y = 2
-y = 7
-purr y
-```
-
-must include `9` and `7`.
-
-Multiline input:
-
-```text
-pounce greet(nyame: meow) {
-purr "Henlo, {nyame}"
-}
-greet("Mafu")
-```
-
-must define the function and print `Henlo, Mafu`.
-
-Error recovery transcript:
-- submit `purr 1 / 0`;
-- then submit `purr "still here"`;
-- output must contain the HISS diagnostic and `still here`.
-
-- [ ] **Step 2: Run REPL tests and confirm failure**
-
-```bash
-go test ./internal/repl -v
-```
-
-Expected: compilation failure.
-
-- [ ] **Step 3: Implement persistent REPL session state**
-
-Create a session object that owns:
-- persistent checker state/global semantic scope;
-- persistent runtime global environment and function declarations;
-- accumulated source-name counter such as `<repl:1>`, `<repl:2>`;
-- input balance state.
-
-Treat each submitted REPL unit transactionally: clone the checker global state and runtime global environment, check and execute against the clones, and commit both clones only when the unit succeeds. A syntax/checker/runtime HISS must leave the previously committed REPL state unchanged. This keeps semantic and runtime state synchronized even when an error occurs before or after a declaration.
-
-Do not concatenate all previous REPL source and re-execute it. Execute only the new submission against the persistent committed session state.
-
-- [ ] **Step 4: Run REPL and CLI tests**
-
-```bash
-go test ./internal/repl ./cmd/nyarn -v
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Commit REPL**
-
-```bash
-git add internal/repl cmd/nyarn
-git commit -m "feat: add Nyarn REPL"
 ```
 
 ---
@@ -1713,7 +1794,7 @@ git commit -m "docs: introduce Nyarn to the world"
 Before calling Nyarn v1 implementation-complete, run exactly:
 
 ```bash
-gofmt -w cmd internal tests
+gofmt -w $(find cmd internal tests -type f -name '*.go')
 go test ./...
 go test -race ./...
 go vet ./...
